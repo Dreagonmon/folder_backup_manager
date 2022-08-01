@@ -14,32 +14,20 @@ import os, sys, asyncio
 APP_ROOT = os.path.abspath(os.path.dirname(__file__))
 sys.path.insert(0, APP_ROOT) # ensure import path
 os.chdir(APP_ROOT)
-import re, utils, time
+import items, utils
 
-REGEXP_CACHE = re.compile(r".*cache.*", re.IGNORECASE)
-
-def filter(path: str):
-    if path.startswith("/."):
-        return True
-    return REGEXP_CACHE.match(path)
-    pass
+def random_str(size):
+    return hex(int.from_bytes(os.urandom(size//2), "big"))[2:].upper()
 
 async def main():
     print("========")
-    # print(await utils.async_input("EN? "))
-    for _ in range(1):
-        lst = set()
-        ts = time.time_ns()
-        # async for f in utils.list_dir_gen("/run/media/dreagonmon/Data/", filter=filter):
-        async for f in utils.list_dir_gen("/home/dreagonmon/", filter=filter):
-        # async for f in utils.list_dir_gen("."):
-            # print(f)
-            lst.add(f)
-            pass
-        te = time.time_ns()
-        # for f in lst: print(f)
-        print("扫描到的文件数:", len(lst))
-        print("花费时间:", (te - ts) / 1_000_000)
+    cfg = items.get_config()
+    s_dir = cfg.backup_items[0].source_folders[0]
+    b_dir = cfg.backup_items[0].backup_folders[0]
+    async for proc in utils.backup_files(s_dir, b_dir):
+        stage, count, total, info = proc
+        # if stage == utils.BackupProgressStage.ERROR:
+        print(f"{stage.name} || <{count}/{total}> || {info}")
 
 if __name__ == "__main__":
     asyncio.run(main())

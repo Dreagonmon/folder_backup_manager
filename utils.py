@@ -1,16 +1,36 @@
 import os, sys, asyncio, shlex, shutil, atexit
+from enum import Enum, auto
 from typing import Optional, Tuple, List, Union, Callable, Generator
 from concurrent.futures import ThreadPoolExecutor
-
-_io_executor = ThreadPoolExecutor(os.cpu_count() * 2)
-atexit.register(lambda: _io_executor.shutdown())
 
 _input_lock = asyncio.Lock()
 _encoding = sys.getdefaultencoding()
 _join = os.path.join
 _isdir = os.path.isdir
+_exists = os.path.exists
+_dirname = os.path.dirname
 _stat = os.stat
+_remove = os.remove
+_makedirs = os.makedirs
+_access = os.access
+_rmtree = shutil.rmtree
+_copy2 = shutil.copy2
+_io_executor = ThreadPoolExecutor(os.cpu_count() * 2)
+atexit.register(lambda: _io_executor.shutdown())
 
+class BackupProgressStage(Enum):
+    LIST = auto()
+    COMPARE = auto()
+    DELETE = auto()
+    COPY = auto()
+    ERROR = auto()
+
+Done = int
+Total = int
+Info = str
+BackupProgress = Tuple[BackupProgressStage, Done, Total, Info]
+
+# Misc
 def _unix_join_1(pt: str, *pts):
     if pt.endswith("/"):
         return pt + "/".join(pts)
@@ -56,12 +76,11 @@ class FileItem:
         return False
     
     def __repr__(self) -> str:
-        return f"FileItem({self.path}, {self.is_dir}, {self.mtime}, {self.size})"
+        return f"FileItem({repr(self.path)}, {self.is_dir}, {self.mtime}, {self.size})"
 
-async def list_dir_gen(tree_root: str, rel_path: str = "", base: str = "/", *, filter: Callable[[str], Optional[bool]] = lambda _: False, follow_link=False) -> Generator[FileItem, None, None]:
+async def list_dir_gen(tree_root: str, rel_path: str = "", base: str = "/", ignore_path: set[str] = set(), *, filter: Callable[[str], Optional[bool]] = lambda _: False, follow_link=False) -> Generator[FileItem, None, None]:
     if filter(base):
         return
-    ignore_path: set[str] = set()
     if await is_git_dir(tree_root):
         for f in await list_git_ignored_files(tree_root):
             ignore_path.add(_join(rel_path, f))
@@ -70,20 +89,72 @@ async def list_dir_gen(tree_root: str, rel_path: str = "", base: str = "/", *, f
             for entry in it:
                 name, is_dir, is_file = entry.name, entry.is_dir(follow_symlinks=follow_link), entry.is_file(follow_symlinks=True)
                 item_path = _join(rel_path, name)
+                if filter(_unix_join_1(base, name)):
+                    continue
                 if is_dir:
                     yield FileItem(item_path, True, 0, 0)
-                    async for file in list_dir_gen(_join(tree_root, name), item_path, _unix_join_1(base, name), filter=filter, follow_link=follow_link):
+                    async for file in list_dir_gen(_join(tree_root, name), item_path, _unix_join_1(base, name), ignore_path, filter=filter, follow_link=follow_link):
                         if file.path in ignore_path:
                             continue
                         yield file
                 elif is_file:
-                    if filter(_unix_join_1(base, name)):
-                        continue
                     if item_path in ignore_path:
                         continue
                     stat = _stat(_join(tree_root, name))
                     yield FileItem(item_path, False, int(stat.st_mtime), stat.st_size)
     except (FileNotFoundError, PermissionError): pass
+
+# BackupFiles
+async def backup_files(source_dir: str, target_dir: str) -> Generator[BackupProgress, None, None]:
+    _makedirs(source_dir, exist_ok=True)
+    _makedirs(target_dir, exist_ok=True)
+    # List
+    yield BackupProgressStage.LIST, 0, 0, "Start backup."
+    source_files: set[FileItem] = set()
+    target_files: set[FileItem] = set()
+    async for f in list_dir_gen(target_dir):
+        target_files.add(f)
+        yield BackupProgressStage.LIST, len(target_files), 0, f.path
+    async for f in list_dir_gen(source_dir):
+        source_files.add(f)
+        yield BackupProgressStage.LIST, len(target_files), len(source_files), f.path
+    # Compare
+    yield BackupProgressStage.COMPARE, 0, 0, "Start compare."
+    copy_files = source_files - target_files
+    delete_files = target_files - source_files
+    # Delete
+    delete_count = len(delete_files)
+    done_count = 0
+    yield BackupProgressStage.DELETE, 0, delete_count, "Start delete"
+    for file in delete_files:
+        done_count += 1
+        try:
+            target_path = _join(target_dir, file.path)
+            if _exists(target_path):
+                if file.is_dir:
+                    _rmtree(target_path)
+                else:
+                    _remove(target_path)
+            yield BackupProgressStage.DELETE, done_count, delete_count, file.path
+        except OSError:
+            yield BackupProgressStage.ERROR, done_count, delete_count, file.path
+    # Copy
+    copy_count = len(copy_files)
+    done_count = 0
+    yield BackupProgressStage.COPY, 0, copy_count, "Start copy"
+    for file in copy_files:
+        done_count += 1
+        try:
+            target_path = _join(target_dir, file.path)
+            if file.is_dir:
+                _makedirs(target_path, exist_ok=True)
+            else:
+                _makedirs(_dirname(target_path), exist_ok=True)
+                _copy2(_join(source_dir, file.path), target_path)
+            yield BackupProgressStage.COPY, done_count, copy_count, file.path
+        except OSError:
+            yield BackupProgressStage.ERROR, done_count, copy_count, file.path
+    pass
 
 # command line wraper
 GIT = shutil.which("git")
