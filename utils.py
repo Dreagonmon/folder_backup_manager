@@ -12,7 +12,6 @@ _dirname = os.path.dirname
 _stat = os.stat
 _remove = os.remove
 _makedirs = os.makedirs
-_access = os.access
 _rmtree = shutil.rmtree
 _copy2 = shutil.copy2
 _io_executor = ThreadPoolExecutor(os.cpu_count() * 2)
@@ -105,9 +104,21 @@ async def list_dir_gen(tree_root: str, rel_path: str = "", base: str = "/", igno
     except (FileNotFoundError, PermissionError): pass
 
 # BackupFiles
+def _get_sudo_info() -> Tuple[bool, int, int]:
+    if os.name != "posix":
+        return False, 0, 0
+    real_uid = os.getuid()
+    if real_uid == 0 and "SUDO_UID" in os.environ and "SUDO_GID" in os.environ:
+        uid = int(os.environ["SUDO_UID"])
+        gid = int(os.environ["SUDO_GID"])
+        return True, uid, gid
+    return False, real_uid, os.getgid()
+
 async def backup_files(source_dir: str, target_dir: str) -> Generator[BackupProgress, None, None]:
+    is_sudo, uid, gid = _get_sudo_info()
     _makedirs(source_dir, exist_ok=True)
     _makedirs(target_dir, exist_ok=True)
+    if is_sudo: os.chown(target_dir, uid, gid)
     # List
     yield BackupProgressStage.LIST, 0, 0, "Start backup."
     source_files: set[FileItem] = set()
@@ -151,6 +162,7 @@ async def backup_files(source_dir: str, target_dir: str) -> Generator[BackupProg
             else:
                 _makedirs(_dirname(target_path), exist_ok=True)
                 _copy2(_join(source_dir, file.path), target_path)
+            if is_sudo: os.chown(target_path, uid, gid)
             yield BackupProgressStage.COPY, done_count, copy_count, file.path
         except OSError:
             yield BackupProgressStage.ERROR, done_count, copy_count, file.path
