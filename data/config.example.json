@@ -1,0 +1,21 @@
+{
+    "backup_items": [
+        {
+            "name": "You Set a Name",
+            "source_folders": [
+                "/root/rsync_backup_manager/test/source"
+            ],
+            "backup_folders": [
+                "/root/rsync_backup_manager/test/target"
+            ],
+            "excludes": [
+                "\\/build",
+                ".*\\/tmp[^a-zA-Z].*"
+            ],
+            "includes": [
+                ".*\\/tmp_config\\.json"
+            ],
+            "options": []
+        }
+    ]
+}

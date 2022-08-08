@@ -1,9 +1,7 @@
-import os, sys, asyncio, shlex, shutil, atexit
+import os, sys, asyncio, shlex, shutil
 from enum import Enum, auto
 from typing import Optional, Tuple, List, Union, Callable, Generator
-from concurrent.futures import ThreadPoolExecutor
 
-_input_lock = asyncio.Lock()
 _encoding = sys.getdefaultencoding()
 _join = os.path.join
 _isdir = os.path.isdir
@@ -14,15 +12,17 @@ _remove = os.remove
 _makedirs = os.makedirs
 _rmtree = shutil.rmtree
 _copy2 = shutil.copy2
-_io_executor = ThreadPoolExecutor(os.cpu_count() * 2)
-atexit.register(lambda: _io_executor.shutdown())
 
 class BackupProgressStage(Enum):
     LIST = auto()
-    COMPARE = auto()
+    LISTED = auto()
+    TO_DELETE = auto()
+    TO_COPY = auto()
+    COMPAREED = auto()
     DELETE = auto()
     COPY = auto()
     ERROR = auto()
+    FINISHED = auto()
 
 Done = int
 Total = int
@@ -50,10 +50,6 @@ async def shell(cmd: Union[str, List[str]], cwd: str = None) -> Tuple[asyncio.su
     stdout, stderr = await proc.communicate()
     return proc, stdout, stderr
 
-async def async_input(prompt: str = "") -> str:
-    async with _input_lock:
-        return await asyncio.get_event_loop().run_in_executor(_io_executor, input, prompt)
-
 # List dir
 class FileItem:
     def __init__(self, path: str, is_dir: bool, mtime: int, size: int):
@@ -77,8 +73,8 @@ class FileItem:
     def __repr__(self) -> str:
         return f"FileItem({repr(self.path)}, {self.is_dir}, {self.mtime}, {self.size})"
 
-async def list_dir_gen(tree_root: str, rel_path: str = "", base: str = "/", ignore_path: set[str] = set(), *, filter: Callable[[str], Optional[bool]] = lambda _: False, follow_link=False) -> Generator[FileItem, None, None]:
-    if filter(base):
+async def list_dir_gen(tree_root: str, rel_path: str = "", base: str = "/", ignore_path: set[str] = set(), *, filter: Callable[[str], bool] = lambda _: True, follow_link=False) -> Generator[FileItem, None, None]:
+    if not filter(base):
         return
     if await is_git_dir(tree_root):
         for f in await list_git_ignored_files(tree_root):
@@ -88,7 +84,7 @@ async def list_dir_gen(tree_root: str, rel_path: str = "", base: str = "/", igno
             for entry in it:
                 name, is_dir, is_file = entry.name, entry.is_dir(follow_symlinks=follow_link), entry.is_file(follow_symlinks=True)
                 item_path = _join(rel_path, name)
-                if filter(_unix_join_1(base, name)):
+                if not filter(_unix_join_1(base, name)):
                     continue
                 if is_dir:
                     yield FileItem(item_path, True, 0, 0)
@@ -114,7 +110,7 @@ def _get_sudo_info() -> Tuple[bool, int, int]:
         return True, uid, gid
     return False, real_uid, os.getgid()
 
-async def backup_files(source_dir: str, target_dir: str) -> Generator[BackupProgress, None, None]:
+async def backup_files(source_dir: str, target_dir: str, filter: Callable[[str], bool]) -> Generator[BackupProgress, None, None]:
     is_sudo, uid, gid = _get_sudo_info()
     _makedirs(source_dir, exist_ok=True)
     _makedirs(target_dir, exist_ok=True)
@@ -126,13 +122,18 @@ async def backup_files(source_dir: str, target_dir: str) -> Generator[BackupProg
     async for f in list_dir_gen(target_dir):
         target_files.add(f)
         yield BackupProgressStage.LIST, len(target_files), 0, f.path
-    async for f in list_dir_gen(source_dir):
+    async for f in list_dir_gen(source_dir, filter=filter):
         source_files.add(f)
         yield BackupProgressStage.LIST, len(target_files), len(source_files), f.path
+    yield BackupProgressStage.LISTED, 0, 0, "All files listed"
     # Compare
-    yield BackupProgressStage.COMPARE, 0, 0, "Start compare."
-    copy_files = source_files - target_files
     delete_files = target_files - source_files
+    for file in delete_files:
+        yield BackupProgressStage.TO_DELETE, 0, 0, file.path
+    copy_files = source_files - target_files
+    for file in copy_files:
+        yield BackupProgressStage.TO_COPY, 0, 0, file.path
+    yield BackupProgressStage.COMPAREED, 0, 0, "All files compared"
     # Delete
     delete_count = len(delete_files)
     done_count = 0
@@ -166,7 +167,7 @@ async def backup_files(source_dir: str, target_dir: str) -> Generator[BackupProg
             yield BackupProgressStage.COPY, done_count, copy_count, file.path
         except OSError:
             yield BackupProgressStage.ERROR, done_count, copy_count, file.path
-    pass
+    yield BackupProgressStage.FINISHED, 0, 0, "Finished"
 
 # command line wraper
 GIT = shutil.which("git")
